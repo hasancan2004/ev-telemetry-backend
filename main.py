@@ -1,9 +1,24 @@
 import asyncio
 import random
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
+from database import init_db, SessionLocal, TelemetryLog
 
 app = FastAPI(title="EV Telemetry Simulator")
+
+# Sunucu ilk açıldığında veritabanını ve tabloları otomatik oluşturur
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+# Her HTTP isteğinde veritabanı oturumunu güvenli açıp kapatan bağımlılık (Dependency)
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 class EVTelemetry(BaseModel):
     speed_kmh: int
@@ -17,18 +32,41 @@ class EVTelemetry(BaseModel):
 def read_root():
     return {"status": "online", "message": "EV Telemetry Backend is running."}
 
+# Mobil tarafın geçmiş sürüş analizini çekebileceği yeni REST API endpoint'i
+@app.get("/api/v1/telemetry/history")
+def get_telemetry_history(limit: int = 20, db: Session = Depends(get_db)):
+    logs = db.query(TelemetryLog).order_by(TelemetryLog.timestamp.desc()).limit(limit).all()
+    return logs
+
 @app.websocket("/ws/telemetry")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
-    # Aracın dışarıdan müdahale edilebilir anlık durumu (State)
     vehicle_state = {
         "battery": 85.0,
         "suspension_mode": "Comfort",
         "cabin_temp": 22.0
     }
 
-    # 1. GÖREV: Sürekli veri fırlatan asenkron döngü
+    # Senkron veritabanı kaydetme fonksiyonu
+    def save_to_database(telemetry: EVTelemetry):
+        db = SessionLocal()
+        try:
+            db_log = TelemetryLog(
+                speed_kmh=telemetry.speed_kmh,
+                battery_level_pct=telemetry.battery_level_pct,
+                regeneration_kw=telemetry.regeneration_kw,
+                cabin_temperature_c=telemetry.cabin_temperature_c,
+                suspension_mode=telemetry.suspension_mode,
+                tire_pressure_psi=telemetry.tire_pressure_psi
+            )
+            db.add(db_log)
+            db.commit()
+        except Exception as e:
+            print(f"Database write error: {e}")
+        finally:
+            db.close()
+
     async def send_telemetry():
         try:
             while True:
@@ -44,34 +82,30 @@ async def websocket_endpoint(websocket: WebSocket):
                     suspension_mode=vehicle_state["suspension_mode"],
                     tire_pressure_psi=round(random.uniform(32.0, 36.0), 1)
                 )
+                
+                # Veriyi soketten fırlat
                 await websocket.send_json(telemetry_data.model_dump())
+                
+                # Mühendislik Şovu: Bloklamayan arka plan thread'i ile veritabanına kaydet
+                await asyncio.to_thread(save_to_database, telemetry_data)
+                
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             pass
 
-    # Veri gönderme işini (Task) arka planda başlatıyoruz
     sender_task = asyncio.create_task(send_telemetry())
 
     try:
-        # 2. GÖREV: İstemciden (Mobil/Postman) gelen komutları dinleyen döngü
         while True:
-            # Dışarıdan gelen JSON formatındaki komutu bekle ve yakala
             client_message = await websocket.receive_json()
-            print(f"Received command from client: {client_message}")
-            
-            # Gelen komutları işle ve aracın durumunu anında güncelle
             if "suspension_mode" in client_message:
                 vehicle_state["suspension_mode"] = client_message["suspension_mode"]
-                print(f"Suspension changed to: {vehicle_state['suspension_mode']}")
-                
             if "cabin_temp" in client_message:
                 vehicle_state["cabin_temp"] = client_message["cabin_temp"]
-                print(f"Cabin temp changed to: {vehicle_state['cabin_temp']}")
 
     except WebSocketDisconnect:
         print("Client disconnected.")
     except Exception as e:
         print(f"Error receiving data: {e}")
     finally:
-        # İstemci bağlantıyı kestiğinde arka planda çalışan veri gönderme görevini de iptal et
         sender_task.cancel()
