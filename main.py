@@ -5,10 +5,9 @@ from pydantic import BaseModel
 
 app = FastAPI(title="EV Telemetry Simulator")
 
-# Pydantic modelimiz (Kotlin'deki Data Class'ın tam karşılığı)
 class EVTelemetry(BaseModel):
     speed_kmh: int
-    battery_level_pct: int
+    battery_level_pct: float
     regeneration_kw: float
     cabin_temperature_c: float
     suspension_mode: str
@@ -16,45 +15,63 @@ class EVTelemetry(BaseModel):
 
 @app.get("/")
 def read_root():
-    # REST API için İngilizce durum mesajı
     return {"status": "online", "message": "EV Telemetry Backend is running."}
 
 @app.websocket("/ws/telemetry")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    
+    # Aracın dışarıdan müdahale edilebilir anlık durumu (State)
+    vehicle_state = {
+        "battery": 85.0,
+        "suspension_mode": "Comfort",
+        "cabin_temp": 22.0
+    }
+
+    # 1. GÖREV: Sürekli veri fırlatan asenkron döngü
+    async def send_telemetry():
+        try:
+            while True:
+                speed = random.randint(40, 120)
+                regen = random.uniform(5.0, 30.0) if speed < 60 else 0.0 
+                vehicle_state["battery"] -= random.uniform(0.01, 0.03) 
+                
+                telemetry_data = EVTelemetry(
+                    speed_kmh=speed,
+                    battery_level_pct=round(vehicle_state["battery"], 2),
+                    regeneration_kw=round(regen, 1),
+                    cabin_temperature_c=vehicle_state["cabin_temp"],
+                    suspension_mode=vehicle_state["suspension_mode"],
+                    tire_pressure_psi=round(random.uniform(32.0, 36.0), 1)
+                )
+                await websocket.send_json(telemetry_data.model_dump())
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+
+    # Veri gönderme işini (Task) arka planda başlatıyoruz
+    sender_task = asyncio.create_task(send_telemetry())
+
     try:
-        # Başlangıç batarya seviyesi
-        battery_level = 85.0
-
-
+        # 2. GÖREV: İstemciden (Mobil/Postman) gelen komutları dinleyen döngü
         while True:
-            # Simülasyon verileri üretme
-            speed = random.randint(40, 120)
-
-            # Araç yavaşlarken (hız düşükken) rejeneratif frenleme devreye girsin
-            regen = random.uniform(5.0, 30.0) if speed < 60 else 0.0
-
-            # Batarya her saniye çok ufak miktarda azalsın
-            battery -= random.uniform(0.01, 0.03)
-
-            telemetry_data = EVTelemetry(
-                speed_kmh=speed,
-                battery_level_pct=round(battery, 2),
-                regeneration_kw=round(regen, 1),
-                cabin_temperature_c = round(random.uniform(20.0, 24.0), 1),
-                suspension_mode=random.choice(["Comfort", "Sport", "Eco"]),
-                tire_pressure_psi=round(random.uniform(32.0, 36.0), 1)
-            )
-
-            # Veriyi JSON formatında istemciye fırlat
-            await websocket.send_json(telemetry_data.model_dump())
-
-            # 1 saniye bekle (saniyede 1 veri basar)
-            await asyncio.sleep(1)
+            # Dışarıdan gelen JSON formatındaki komutu bekle ve yakala
+            client_message = await websocket.receive_json()
+            print(f"Received command from client: {client_message}")
+            
+            # Gelen komutları işle ve aracın durumunu anında güncelle
+            if "suspension_mode" in client_message:
+                vehicle_state["suspension_mode"] = client_message["suspension_mode"]
+                print(f"Suspension changed to: {vehicle_state['suspension_mode']}")
+                
+            if "cabin_temp" in client_message:
+                vehicle_state["cabin_temp"] = client_message["cabin_temp"]
+                print(f"Cabin temp changed to: {vehicle_state['cabin_temp']}")
 
     except WebSocketDisconnect:
-        # İstemci (mobil uygulama) bağlantıyı kestiğinde verilecek İngilizce log
-        print("Client disconnected from the telemetry stream.")
+        print("Client disconnected.")
     except Exception as e:
-        # Beklenmeyen bir hata durumunda İngilizce log
-        print(f"Connection error: {e}")
+        print(f"Error receiving data: {e}")
+    finally:
+        # İstemci bağlantıyı kestiğinde arka planda çalışan veri gönderme görevini de iptal et
+        sender_task.cancel()
