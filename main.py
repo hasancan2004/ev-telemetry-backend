@@ -7,12 +7,10 @@ from database import init_db, SessionLocal, TelemetryLog
 
 app = FastAPI(title="EV Telemetry Simulator")
 
-# Sunucu ilk açıldığında veritabanını ve tabloları otomatik oluşturur
 @app.on_event("startup")
 def on_startup():
     init_db()
 
-# Her HTTP isteğinde veritabanı oturumunu güvenli açıp kapatan bağımlılık (Dependency)
 def get_db():
     db = SessionLocal()
     try:
@@ -20,6 +18,7 @@ def get_db():
     finally:
         db.close()
 
+# Pydantic modelimize GPS verilerini ekledik
 class EVTelemetry(BaseModel):
     speed_kmh: int
     battery_level_pct: float
@@ -27,12 +26,13 @@ class EVTelemetry(BaseModel):
     cabin_temperature_c: float
     suspension_mode: str
     tire_pressure_psi: float
+    latitude: float
+    longitude: float
 
 @app.get("/")
 def read_root():
     return {"status": "online", "message": "EV Telemetry Backend is running."}
 
-# Mobil tarafın geçmiş sürüş analizini çekebileceği yeni REST API endpoint'i
 @app.get("/api/v1/telemetry/history")
 def get_telemetry_history(limit: int = 20, db: Session = Depends(get_db)):
     logs = db.query(TelemetryLog).order_by(TelemetryLog.timestamp.desc()).limit(limit).all()
@@ -42,13 +42,15 @@ def get_telemetry_history(limit: int = 20, db: Session = Depends(get_db)):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
+    # Arabanın başlangıç konumu (Seydişehir merkez civarı)
     vehicle_state = {
         "battery": 85.0,
         "suspension_mode": "Comfort",
-        "cabin_temp": 22.0
+        "cabin_temp": 22.0,
+        "latitude": 37.4194,
+        "longitude": 31.8475
     }
 
-    # Senkron veritabanı kaydetme fonksiyonu
     def save_to_database(telemetry: EVTelemetry):
         db = SessionLocal()
         try:
@@ -58,7 +60,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 regeneration_kw=telemetry.regeneration_kw,
                 cabin_temperature_c=telemetry.cabin_temperature_c,
                 suspension_mode=telemetry.suspension_mode,
-                tire_pressure_psi=telemetry.tire_pressure_psi
+                tire_pressure_psi=telemetry.tire_pressure_psi,
+                latitude=telemetry.latitude,     # DB'ye kaydet
+                longitude=telemetry.longitude    # DB'ye kaydet
             )
             db.add(db_log)
             db.commit()
@@ -74,19 +78,23 @@ async def websocket_endpoint(websocket: WebSocket):
                 regen = random.uniform(5.0, 30.0) if speed < 60 else 0.0 
                 vehicle_state["battery"] -= random.uniform(0.01, 0.03) 
                 
+                # SİMÜLASYON: Araba hareket ediyor! (Her saniye konumu çok hafif değiştiriyoruz)
+                # Kuzeydoğu yönüne doğru gidiyor gibi düşün
+                vehicle_state["latitude"] += 0.0002 
+                vehicle_state["longitude"] += 0.0002 
+                
                 telemetry_data = EVTelemetry(
                     speed_kmh=speed,
                     battery_level_pct=round(vehicle_state["battery"], 2),
                     regeneration_kw=round(regen, 1),
                     cabin_temperature_c=vehicle_state["cabin_temp"],
                     suspension_mode=vehicle_state["suspension_mode"],
-                    tire_pressure_psi=round(random.uniform(32.0, 36.0), 1)
+                    tire_pressure_psi=round(random.uniform(32.0, 36.0), 1),
+                    latitude=round(vehicle_state["latitude"], 5),
+                    longitude=round(vehicle_state["longitude"], 5)
                 )
                 
-                # Veriyi soketten fırlat
                 await websocket.send_json(telemetry_data.model_dump())
-                
-                # Mühendislik Şovu: Bloklamayan arka plan thread'i ile veritabanına kaydet
                 await asyncio.to_thread(save_to_database, telemetry_data)
                 
                 await asyncio.sleep(1)
