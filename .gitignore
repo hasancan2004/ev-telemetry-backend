@@ -1,2 +1,6 @@
 venv/
 __pycache__/
+
+# Data Science & Machine Learning Files
+ev_maintenance_data.csv
+ev_health_model.pkl
