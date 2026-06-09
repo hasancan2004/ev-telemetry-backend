@@ -5,8 +5,19 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from database import init_db, SessionLocal, TelemetryLog
+import joblib # YENİ: Eğitilen modeli yüklemek için ekledik
 
 app = FastAPI(title="EV Fleet Telemetry Simulator")
+
+# ========================================================
+# YENİ: YAPAY ZEKA MODELİNİN YÜKLENMESİ
+# ========================================================
+try:
+    ai_model = joblib.load("ev_health_model.pkl")
+    print("AI MODEL STATUS: Eğitilmiş yapay zeka modeli başarıyla yüklendi!")
+except Exception as e:
+    ai_model = None
+    print(f"AI MODEL STATUS ERROR: Model yüklenemedi: {e}")
 
 @app.on_event("startup")
 def on_startup():
@@ -19,7 +30,7 @@ def get_db():
     finally:
         db.close()
 
-# Pydantic modelimize "vehicle_id" eklendi
+# Pydantic modelimize yapay zekanın üreteceği "maintenance_risk_pct" alanını ekledik
 class EVTelemetry(BaseModel):
     vehicle_id: str
     speed_kmh: int
@@ -30,14 +41,14 @@ class EVTelemetry(BaseModel):
     tire_pressure_psi: float
     latitude: float
     longitude: float
+    maintenance_risk_pct: float # YENİ: Yapay zekanın arıza risk tahmini (%)
 
 @app.get("/")
 def read_root():
-    return {"status": "online", "message": "Fleet Backend is running."}
+    return {"status": "online", "message": "Fleet Backend with AI Engine is running."}
 
 @app.get("/api/v1/telemetry/history")
 def get_telemetry_history(vehicle_id: str = None, limit: int = 100, db: Session = Depends(get_db)):
-    # YENİ: Artık Android bizden geçmişi isterken belirli bir aracın (örn: EV-002) geçmişini isteyebilir
     query = db.query(TelemetryLog)
     if vehicle_id:
         query = query.filter(TelemetryLog.vehicle_id == vehicle_id)
@@ -48,13 +59,10 @@ def get_telemetry_history(vehicle_id: str = None, limit: int = 100, db: Session 
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
-    # ==========================================
-    # YENİ: FİLO TANIMLAMASI (3 Farklı Araç)
-    # ==========================================
     fleet_state = {
         "EV-001": {"battery": 85.0, "suspension": "Comfort", "temp": 22.0, "lat": 37.4194, "lng": 31.8475, "active": True},
         "EV-002": {"battery": 42.5, "suspension": "Sport", "temp": 20.0, "lat": 37.4250, "lng": 31.8500, "active": True},
-        "EV-003": {"battery": 15.2, "suspension": "Eco", "temp": 24.0, "lat": 37.4100, "lng": 31.8300, "active": False} # Şarjda olan araç
+        "EV-003": {"battery": 15.2, "suspension": "Eco", "temp": 24.0, "lat": 37.4100, "lng": 31.8300, "active": False}
     }
 
     def save_to_database(telemetries: List[EVTelemetry]):
@@ -71,6 +79,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     tire_pressure_psi=t.tire_pressure_psi,
                     latitude=t.latitude,
                     longitude=t.longitude
+                    # Not: Veritabanı şemasını bozmamak için risk yüzdesini şimdilik log tablosuna kaydetmiyoruz, 
+                    # sadece soketten anlık canlı veri olarak basacağız.
                 )
                 db.add(db_log)
             db.commit()
@@ -84,34 +94,57 @@ async def websocket_endpoint(websocket: WebSocket):
             while True:
                 fleet_telemetry_list = []
                 
-                # Filonun içindeki tüm araçları tek tek gezip durumlarını güncelliyoruz
                 for v_id, state in fleet_state.items():
                     if state["active"]:
-                        speed = random.randint(40, 90)
-                        regen = random.uniform(5.0, 15.0) if speed < 60 else 0.0
+                        # Arada sırada yapay zekayı test etmek için kasti anomaliler (yüksek sıcaklık) yaratıyoruz
+                        if random.random() < 0.15: 
+                            speed = random.randint(95, 120)
+                            temp = round(random.uniform(38.0, 52.0), 1) # Sıcaklık fırladı
+                            pressure = round(random.uniform(22.0, 26.0), 1) # Lastik iniyor
+                        else:
+                            speed = random.randint(40, 85)
+                            temp = state["temp"]
+                            pressure = round(random.uniform(32.0, 35.0), 1)
+
+                        regen = round(random.uniform(5.0, 15.0), 1) if speed < 60 else 0.0
                         state["battery"] -= random.uniform(0.01, 0.03)
                         state["lat"] += random.uniform(-0.0001, 0.0003)
                         state["lng"] += random.uniform(-0.0001, 0.0003)
                     else:
                         speed = 0
                         regen = 0.0
+                        temp = state["temp"]
+                        pressure = round(random.uniform(33.0, 34.0), 1)
                         if state["battery"] < 100:
-                            state["battery"] += 0.05 # Şarj oluyor
+                            state["battery"] += 0.05
                     
+                    # ========================================================
+                    # YENİ: ANLIK YAPAY ZEKA TAHMİNİ (PREDICTION)
+                    # ========================================================
+                    risk_percentage = 0.0
+                    if ai_model:
+                        # Modelin eğitildiği sırayla verileri dizi olarak veriyoruz
+                        features = [[speed, state["battery"], regen, temp, pressure]]
+                        
+                        # predict_proba bize [[sağlam_olma_olasılığı, arıza_olma_olasılığı]] döner.
+                        # Biz arıza olasılığını ([0][1]) alıp 100 ile çarpıyoruz.
+                        probabilities = ai_model.predict_proba(features)
+                        risk_percentage = round(probabilities[0][1] * 100, 1)
+
                     telemetry = EVTelemetry(
                         vehicle_id=v_id,
                         speed_kmh=speed,
                         battery_level_pct=round(state["battery"], 2),
                         regeneration_kw=round(regen, 1),
-                        cabin_temperature_c=state["temp"],
+                        cabin_temperature_c=temp,
                         suspension_mode=state["suspension"],
-                        tire_pressure_psi=round(random.uniform(32.0, 36.0), 1),
+                        tire_pressure_psi=pressure,
                         latitude=round(state["lat"], 5),
-                        longitude=round(state["lng"], 5)
+                        longitude=round(state["lng"], 5),
+                        maintenance_risk_pct=risk_percentage # AI risk puanı eklendi!
                     )
                     fleet_telemetry_list.append(telemetry)
                 
-                # KRİTİK DEĞİŞİKLİK: Artık tek bir obje değil, "[" ile başlayan bir "Liste (Array)" fırlatıyoruz!
                 await websocket.send_json([t.model_dump() for t in fleet_telemetry_list])
                 await asyncio.to_thread(save_to_database, fleet_telemetry_list)
                 
@@ -124,7 +157,6 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             client_message = await websocket.receive_json()
-            # Android'den komut gelirken artık "Hangi araca komut gönderiyoruz?" bilgisini de bekliyoruz
             target_id = client_message.get("vehicle_id", "EV-001")
             
             if target_id in fleet_state:
