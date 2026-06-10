@@ -5,7 +5,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from database import init_db, SessionLocal, TelemetryLog
-import joblib 
+import joblib
+from geofence import check_geofence_breach 
 
 app = FastAPI(title="EV Fleet Telemetry Simulator")
 
@@ -45,7 +46,8 @@ class EVTelemetry(BaseModel):
     maintenance_risk_pct: float # YENİ: Yapay zekanın arıza risk tahmini (%)
     eco_score: int # YENİ: Sürücü davranış skoru (0-100)
     estimated_range_km: int # YENİ: Gerçek kapasiteye göre hesaplanan dinamik menzil
-
+    geofence_breach: bool # YENİ: Sınır ihlali alarmı
+ 
 @app.get("/")
 def read_root():
     return {"status": "online", "message": "Fleet Backend with AI Engine is running."}
@@ -65,7 +67,7 @@ async def websocket_endpoint(websocket: WebSocket):
     fleet_state = {
         "EV-001": {"model": "Mercedes EQE", "capacity_kwh": 90.6, "consumption_kwh": 16.5, "battery": 85.0, "suspension": "Comfort", "temp": 22.0, "lat": 37.8746, "lng": 32.4933, "active": True},
         "EV-002": {"model": "Togg T10X", "capacity_kwh": 88.5, "consumption_kwh": 18.5, "battery": 42.5, "suspension": "Sport", "temp": 20.0, "lat": 37.8800, "lng": 32.4800, "active": True},
-        "EV-003": {"model": "Skoda Enyaq iV", "capacity_kwh": 77.0, "consumption_kwh": 15.8, "battery": 15.2, "suspension": "Eco", "temp": 24.0, "lat": 37.8716, "lng": 32.4851, "active": False} 
+        "EV-003": {"model": "Skoda Enyaq iV", "capacity_kwh": 77.0, "consumption_kwh": 15.8, "battery": 15.2, "suspension": "Eco", "temp": 24.0, "lat": 39.9334, "lng": 32.8597, "active": False}
     }
 
     def save_to_database(telemetries: List[EVTelemetry]):
@@ -169,6 +171,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     actual_consumption = state["consumption_kwh"] * efficiency_multiplier
                     calculated_range = int((current_kwh / actual_consumption) * 100)
 
+                    # ========================================================
+                    # YENİ: GEOFENCE (GÜVENLİK ÇEMBERİ) KONTROLÜ
+                    # ========================================================
+                    is_breached = check_geofence_breach(state["lat"], state["lng"])
+
                     telemetry = EVTelemetry(
                         vehicle_id=v_id,
                         vehicle_model=state["model"], # Araç modeli
@@ -182,7 +189,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         longitude=round(state["lng"], 5),
                         maintenance_risk_pct=risk_percentage, 
                         eco_score=final_eco_score, # VİRGÜL EKLENDİ!
-                        estimated_range_km=calculated_range # Dinamik menzil
+                        estimated_range_km=calculated_range, # Dinamik menzil
+                        geofence_breach=is_breached, # Alarm durumunu JSON'a çiviledik!
                     )
                     fleet_telemetry_list.append(telemetry)
                 
