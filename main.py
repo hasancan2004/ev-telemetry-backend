@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from database import init_db, SessionLocal, TelemetryLog
 import joblib # YENİ: Eğitilen modeli yüklemek için ekledik
+from typing import List
 
 app = FastAPI(title="EV Fleet Telemetry Simulator")
 
@@ -42,6 +43,7 @@ class EVTelemetry(BaseModel):
     latitude: float
     longitude: float
     maintenance_risk_pct: float # YENİ: Yapay zekanın arıza risk tahmini (%)
+    eco_score: int # YENİ: Sürücü davranış skoru (0-100)
 
 @app.get("/")
 def read_root():
@@ -60,9 +62,11 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
     fleet_state = {
-        "EV-001": {"battery": 85.0, "suspension": "Comfort", "temp": 22.0, "lat": 37.4194, "lng": 31.8475, "active": True},
-        "EV-002": {"battery": 42.5, "suspension": "Sport", "temp": 20.0, "lat": 37.4250, "lng": 31.8500, "active": True},
-        "EV-003": {"battery": 15.2, "suspension": "Eco", "temp": 24.0, "lat": 37.4100, "lng": 31.8300, "active": False}
+        "EV-001": {"battery": 85.0, "suspension": "Comfort", "temp": 22.0, "lat": 37.8746, "lng": 32.4933, "active": True},
+        "EV-002": {"battery": 42.5, "suspension": "Sport", "temp": 20.0, "lat": 37.8800, "lng": 32.4800, "active": True},
+        
+        # EV-003'ü tam olarak STATION-001 (ZES) istasyonunun bir sokak yanına park ettik!
+        "EV-003": {"battery": 15.2, "suspension": "Eco", "temp": 24.0, "lat": 37.8716, "lng": 32.4851, "active": False} 
     }
 
     def save_to_database(telemetries: List[EVTelemetry]):
@@ -131,6 +135,27 @@ async def websocket_endpoint(websocket: WebSocket):
                         probabilities = ai_model.predict_proba(features)
                         risk_percentage = round(probabilities[0][1] * 100, 1)
 
+                    # ========================================================
+                    # YENİ: ECO-SCORE (SÜRÜCÜ DAVRANIŞ) HESAPLAMA ALGORİTMASI
+                    # ========================================================
+                    base_score = 100.0
+                    
+                    # 1. Hız Cezası (90 km/h üstü her hız için 1.5 puan kır)
+                    if speed > 90:
+                        base_score -= (speed - 90) * 1.5
+                        
+                    # 2. Sürüş Modu Etkisi
+                    if state["suspension"] == "Sport":
+                        base_score -= 15.0 # Agresif mod cezası
+                    elif state["suspension"] == "Eco":
+                        base_score += 10.0 # Tasarruf modu bonusu
+                        
+                    # 3. Rejenerasyon (Enerji Geri Kazanım) Bonusu
+                    base_score += regen * 1.2
+                    
+                    # Skoru 0 ile 100 arasında sınırla ve tam sayıya çevir
+                    final_eco_score = int(max(0, min(100, base_score)))
+
                     telemetry = EVTelemetry(
                         vehicle_id=v_id,
                         speed_kmh=speed,
@@ -141,7 +166,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         tire_pressure_psi=pressure,
                         latitude=round(state["lat"], 5),
                         longitude=round(state["lng"], 5),
-                        maintenance_risk_pct=risk_percentage # AI risk puanı eklendi!
+                        maintenance_risk_pct=risk_percentage, # AI risk puanı eklendi!
+                        eco_score=final_eco_score # YENİ: Skoru JSON'a ekliyoruz!
                     )
                     fleet_telemetry_list.append(telemetry)
                 
@@ -171,3 +197,45 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"Error receiving data: {e}")
     finally:
         sender_task.cancel()
+
+
+class ChargingStation(BaseModel):
+    id: str
+    name: str
+    provider: str # ZES, Eşarj, Togg Trugo vb.
+    latitude: float
+    longitude: float
+    is_available: bool
+
+# 2. Konya Çevresindeki Sanal Şarj İstasyonları Verisi
+MOCK_STATIONS = [
+    {
+        "id": "STATION-001",
+        "name": "Konya Merkez Hızlı Şarj İstasyonu",
+        "provider": "ZES",
+        "latitude": 37.8715,
+        "longitude": 32.4850,
+        "is_available": True
+    },
+    {
+        "id": "STATION-002",
+        "name": "Selçuklu Alışveriş Merkezi Şarj Noktası",
+        "provider": "Eşarj",
+        "latitude": 37.9150,
+        "longitude": 32.5020,
+        "is_available": True
+    },
+    {
+        "id": "STATION-003",
+        "name": "Karatay Sanayi Bölgesi DC İstasyonu",
+        "provider": "Trugo",
+        "latitude": 37.8620,
+        "longitude": 32.5310,
+        "is_available": False # Şu an kullanım dışı senaryosu için
+    }
+]
+
+# 3. REST API Endpoint'i
+@app.get("/api/v1/charging-stations", response_model=List[ChargingStation])
+def get_charging_stations():
+    return MOCK_STATIONS
