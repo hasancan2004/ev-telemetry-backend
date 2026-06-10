@@ -5,8 +5,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from database import init_db, SessionLocal, TelemetryLog
-import joblib # YENİ: Eğitilen modeli yüklemek için ekledik
-from typing import List
+import joblib 
 
 app = FastAPI(title="EV Fleet Telemetry Simulator")
 
@@ -34,6 +33,7 @@ def get_db():
 # Pydantic modelimize yapay zekanın üreteceği "maintenance_risk_pct" alanını ekledik
 class EVTelemetry(BaseModel):
     vehicle_id: str
+    vehicle_model: str # YENİ: Aracın marka/modeli
     speed_kmh: int
     battery_level_pct: float
     regeneration_kw: float
@@ -44,6 +44,7 @@ class EVTelemetry(BaseModel):
     longitude: float
     maintenance_risk_pct: float # YENİ: Yapay zekanın arıza risk tahmini (%)
     eco_score: int # YENİ: Sürücü davranış skoru (0-100)
+    estimated_range_km: int # YENİ: Gerçek kapasiteye göre hesaplanan dinamik menzil
 
 @app.get("/")
 def read_root():
@@ -62,11 +63,9 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
     fleet_state = {
-        "EV-001": {"battery": 85.0, "suspension": "Comfort", "temp": 22.0, "lat": 37.8746, "lng": 32.4933, "active": True},
-        "EV-002": {"battery": 42.5, "suspension": "Sport", "temp": 20.0, "lat": 37.8800, "lng": 32.4800, "active": True},
-        
-        # EV-003'ü tam olarak STATION-001 (ZES) istasyonunun bir sokak yanına park ettik!
-        "EV-003": {"battery": 15.2, "suspension": "Eco", "temp": 24.0, "lat": 37.8716, "lng": 32.4851, "active": False} 
+        "EV-001": {"model": "Mercedes EQE", "capacity_kwh": 90.6, "consumption_kwh": 16.5, "battery": 85.0, "suspension": "Comfort", "temp": 22.0, "lat": 37.8746, "lng": 32.4933, "active": True},
+        "EV-002": {"model": "Togg T10X", "capacity_kwh": 88.5, "consumption_kwh": 18.5, "battery": 42.5, "suspension": "Sport", "temp": 20.0, "lat": 37.8800, "lng": 32.4800, "active": True},
+        "EV-003": {"model": "Skoda Enyaq iV", "capacity_kwh": 77.0, "consumption_kwh": 15.8, "battery": 15.2, "suspension": "Eco", "temp": 24.0, "lat": 37.8716, "lng": 32.4851, "active": False} 
     }
 
     def save_to_database(telemetries: List[EVTelemetry]):
@@ -83,8 +82,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     tire_pressure_psi=t.tire_pressure_psi,
                     latitude=t.latitude,
                     longitude=t.longitude
-                    # Not: Veritabanı şemasını bozmamak için risk yüzdesini şimdilik log tablosuna kaydetmiyoruz, 
-                    # sadece soketten anlık canlı veri olarak basacağız.
                 )
                 db.add(db_log)
             db.commit()
@@ -156,8 +153,25 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Skoru 0 ile 100 arasında sınırla ve tam sayıya çevir
                     final_eco_score = int(max(0, min(100, base_score)))
 
+                    # ========================================================
+                    # YENİ: DİNAMİK MENZİL (RANGE) HESAPLAMA ALGORİTMASI
+                    # Formül: (Mevcut Batarya kWh / 100 km Tüketimi) * 100
+                    # ========================================================
+                    current_kwh = (state["battery"] / 100.0) * state["capacity_kwh"]
+                    
+                    # Sürüş modu ve anlık hız tüketimi etkiler (Sport ve yüksek hız menzili düşürür)
+                    efficiency_multiplier = 1.0
+                    if state["suspension"] == "Sport": efficiency_multiplier += 0.15
+                    elif state["suspension"] == "Eco": efficiency_multiplier -= 0.10
+                    
+                    if speed > 90: efficiency_multiplier += (speed - 90) * 0.005
+                    
+                    actual_consumption = state["consumption_kwh"] * efficiency_multiplier
+                    calculated_range = int((current_kwh / actual_consumption) * 100)
+
                     telemetry = EVTelemetry(
                         vehicle_id=v_id,
+                        vehicle_model=state["model"], # Araç modeli
                         speed_kmh=speed,
                         battery_level_pct=round(state["battery"], 2),
                         regeneration_kw=round(regen, 1),
@@ -166,8 +180,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         tire_pressure_psi=pressure,
                         latitude=round(state["lat"], 5),
                         longitude=round(state["lng"], 5),
-                        maintenance_risk_pct=risk_percentage, # AI risk puanı eklendi!
-                        eco_score=final_eco_score # YENİ: Skoru JSON'a ekliyoruz!
+                        maintenance_risk_pct=risk_percentage, 
+                        eco_score=final_eco_score, # VİRGÜL EKLENDİ!
+                        estimated_range_km=calculated_range # Dinamik menzil
                     )
                     fleet_telemetry_list.append(telemetry)
                 
