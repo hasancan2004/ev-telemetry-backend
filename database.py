@@ -2,10 +2,23 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
+import os
+from sqlalchemy import create_engine
 
-DATABASE_URL = "sqlite:///./ev_telemetry.db"
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+# Buluttaki DATABASE_URL'i oku, yoksa yerelde SQLite kullan
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./ev_telemetry.db")
+
+# Eğer PostgreSQL kullanılıyorsa ve URL 'postgres://' ile başlıyorsa, SQLAlchemy için 'postgresql://' yap
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# SQLite için farklı argüman gerekir, PostgreSQL için gerekmez
+if "sqlite" in DATABASE_URL:
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    engine = create_engine(DATABASE_URL)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
