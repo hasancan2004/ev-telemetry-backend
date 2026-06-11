@@ -11,8 +11,10 @@ from sqlalchemy.orm import Session
 
 from database import SessionLocal, TelemetryLog, engine, Base
 from geofence import check_geofence_breach
+import warnings
 
-
+# Scikit-learn'ün isimsiz veri uyarısını tamamen susturuyoruz
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("App startup başladı")
