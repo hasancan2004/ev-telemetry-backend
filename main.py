@@ -1,5 +1,6 @@
 import asyncio
 import random
+import warnings
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
@@ -11,10 +12,7 @@ from sqlalchemy.orm import Session
 
 from database import SessionLocal, TelemetryLog, engine, Base
 from geofence import check_geofence_breach
-import warnings
 
-# Scikit-learn'ün isimsiz veri uyarısını tamamen susturuyoruz
-warnings.filterwarnings("ignore", message="X does not have valid feature names")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("App startup başladı")
@@ -216,17 +214,20 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     if ai_model:
                         try:
-                            features = [[
-                                speed,
-                                state["battery"],
-                                regen,
-                                state["temp"],
-                                33.0
-                            ]]
-                            risk_percentage = round(
-                                ai_model.predict_proba(features)[0][1] * 100,
-                                1
-                            )
+                            # NÜKLEER SEÇENEK: Yapay zeka tahmin yaparken çıkan tüm uyarıları yut!
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore")
+                                features = [[
+                                    speed,
+                                    state["battery"],
+                                    regen,
+                                    state["temp"],
+                                    33.0
+                                ]]
+                                risk_percentage = round(
+                                    ai_model.predict_proba(features)[0][1] * 100,
+                                    1
+                                )
                         except Exception as e:
                             print(f"AI prediction error: {e}")
                             risk_percentage = 0.0
@@ -273,17 +274,14 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             try:
-                # GÜNCELLENDI: Android'den gelen uzaktan kontrol komutlarını yakalayan mekanizma
                 data = await websocket.receive_json()
-                print(f"Android'den gelen komut: {data}")
+                print(f"\n🚀🚀🚀 KOMUT GELDİ: {data} 🚀🚀🚀\n")
                 
-                # Gelen paketi doğrula ve fleet_state'i güncelle
                 if data.get("action") == "set_suspension":
                     target_vehicle = data.get("vehicle_id")
                     new_mode = data.get("value")
                     
                     if target_vehicle in fleet_state:
-                        # Merkezi state'i güncelliyoruz!
                         fleet_state[target_vehicle]["suspension"] = new_mode
                         print(f"SUCCESS: {target_vehicle} için süspansiyon {new_mode} yapıldı!")
 
