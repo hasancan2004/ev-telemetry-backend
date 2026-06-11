@@ -100,12 +100,12 @@ def get_telemetry_history(
     db: Session = Depends(get_db)
 ):
     try:
-        query = db.query(TelemetryLog)
+        db_query = db.query(TelemetryLog)
 
         if vehicle_id:
-            query = query.filter(TelemetryLog.vehicle_id == vehicle_id)
+            db_query = db_query.filter(TelemetryLog.vehicle_id == vehicle_id)
 
-        logs = query.order_by(TelemetryLog.timestamp.desc()).limit(limit).all()
+        logs = db_query.order_by(TelemetryLog.timestamp.desc()).limit(limit).all()
         return logs
 
     except Exception as e:
@@ -271,7 +271,20 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             try:
-                await websocket.receive_json()
+                # GÜNCELLENDI: Android'den gelen uzaktan kontrol komutlarını yakalayan mekanizma
+                data = await websocket.receive_json()
+                print(f"Android'den gelen komut: {data}")
+                
+                # Gelen paketi doğrula ve fleet_state'i güncelle
+                if data.get("action") == "set_suspension":
+                    target_vehicle = data.get("vehicle_id")
+                    new_mode = data.get("value")
+                    
+                    if target_vehicle in fleet_state:
+                        # Merkezi state'i güncelliyoruz!
+                        fleet_state[target_vehicle]["suspension"] = new_mode
+                        print(f"SUCCESS: {target_vehicle} için süspansiyon {new_mode} yapıldı!")
+
             except WebSocketDisconnect:
                 print("WebSocket client disconnected")
                 break
