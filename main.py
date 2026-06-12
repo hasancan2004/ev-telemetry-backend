@@ -20,9 +20,6 @@ warnings.filterwarnings("ignore", message="X does not have valid feature names")
 async def lifespan(app: FastAPI):
     print("App startup başladı")
     try:
-        # Uyarı: SQLite kullanıyorsan eski tabloya yeni kolon ekleyemez, 
-        # localde çalıştırırken ev_telemetry.db dosyasını silip yeniden başlat.
-        # Railway (Postgres) tarafında da veritabanını sıfırlamak gerekebilir.
         Base.metadata.create_all(bind=engine)
         print("Tablolar başarıyla oluşturuldu!")
     except Exception as e:
@@ -70,9 +67,20 @@ class EVTelemetry(BaseModel):
     estimated_range_km: int
     geofence_breach: bool
 
+# YENİ: Chat isteklerini yakalamak için Pydantic modeli
+class ChatRequest(BaseModel):
+    message: str
+
 charging_stations_state = {
     "ST1": {"id": "ST1", "name": "Konya ZES Merkezi", "provider": "ZES", "latitude": 37.87, "longitude": 32.48, "is_available": True},
     "ST2": {"id": "ST2", "name": "Eşarj Selçuklu", "provider": "Eşarj", "latitude": 37.89, "longitude": 32.50, "is_available": True}
+}
+
+# MİMARİ DÜZELTME: fleet_state artık Global (Tüm endpointler erişebilir)
+fleet_state = {
+    "EV-001": {"model": "Mercedes EQE", "capacity_kwh": 90.6, "consumption_kwh": 16.5, "battery": 85.0, "suspension": "Comfort", "temp": 22.0, "lat": 37.8746, "lng": 32.4933, "active": True},
+    "EV-002": {"model": "Togg T10X", "capacity_kwh": 88.5, "consumption_kwh": 18.5, "battery": 42.5, "suspension": "Sport", "temp": 20.0, "lat": 37.8800, "lng": 32.4800, "active": True},
+    "EV-003": {"model": "Skoda Enyaq iV", "capacity_kwh": 77.0, "consumption_kwh": 15.8, "battery": 15.2, "suspension": "Eco", "temp": 24.0, "lat": 39.9334, "lng": 32.8597, "active": False}
 }
 
 @app.get("/")
@@ -109,19 +117,12 @@ def reserve_station(station_id: str):
             return {"status": "error", "message": "İstasyon zaten dolu!"}
     return {"status": "error", "message": "İstasyon bulunamadı."}
 
-# YENİ: ANDROID İÇİN HAZIRLANMIŞ MERKEZİ ANALİZ ENDPOINTİ
 @app.get("/api/v1/analytics")
 def get_analytics(db: Session = Depends(get_db)):
     try:
         total_logs = db.query(func.count(TelemetryLog.id)).scalar() or 0
-        
-        # Basit simülasyon: Veritabanındaki her bir saniyelik log ortalama 0.05 kWh enerji tükettiyse
         total_energy = round(total_logs * 0.05, 1)
-        
-        # Tüm filonun ortalama eco-score karnesi
         avg_eco = db.query(func.avg(TelemetryLog.eco_score)).scalar() or 100
-        
-        # Arıza riski %75 ve üzeri olan "Kritik" durumların sayısı
         critical_count = db.query(func.count(TelemetryLog.id)).filter(TelemetryLog.maintenance_risk_pct >= 75.0).scalar() or 0
 
         return {
@@ -135,16 +136,32 @@ def get_analytics(db: Session = Depends(get_db)):
         print(f"Analytics query error: {e}")
         return {"kpi": {"total_energy_kwh": 0.0, "avg_eco_score": 0, "critical_risk_count": 0}}
 
+# YENİ: Akıllı Filo Asistanı Endpoint'i
+@app.post("/api/v1/chat")
+def fleet_assistant_chat(request: ChatRequest):
+    msg = request.message.lower()
+    
+    # NLP Simülasyonu: Gelen mesaja göre anlık state'i tarayıp cevap üretir
+    if "şarj" in msg or "batarya" in msg:
+        low_batt_vehicles = [v for v, data in fleet_state.items() if data["battery"] < 20.0]
+        if low_batt_vehicles:
+            response = f"Şu araçların şarjı %20'nin altında ve acil şarja yönlendirilmeli: {', '.join(low_batt_vehicles)}."
+        else:
+            response = "Şu an tüm araçların batarya seviyesi optimal durumda, şarja acil ihtiyaç duyan araç bulunmuyor."
+    elif "durum" in msg or "özet" in msg or "aktif" in msg:
+        active_count = sum(1 for v in fleet_state.values() if v["active"])
+        response = f"Filomuzda toplam {len(fleet_state)} araç bulunuyor. Şu an {active_count} tanesi aktif operasyonda."
+    elif "risk" in msg or "bakım" in msg or "arıza" in msg:
+        response = "Yapay zeka analizlerine göre şu an filoda anlık olarak acil bakıma muhtaç kritik bir araç görünmüyor. Ancak arka planda motor sıcaklıklarını ve rejeneratif frenleri taramaya devam ediyorum."
+    else:
+        response = "Merhaba! Ben Filo Yapay Zeka Asistanıyım. Bana 'Hangi araçların şarja ihtiyacı var?', 'Filonun durumu ne?' veya 'Riskli araç var mı?' gibi sorular sorabilirsiniz."
+        
+    return {"reply": response}
+
 @app.websocket("/ws/telemetry")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket client connected")
-
-    fleet_state = {
-        "EV-001": {"model": "Mercedes EQE", "capacity_kwh": 90.6, "consumption_kwh": 16.5, "battery": 85.0, "suspension": "Comfort", "temp": 22.0, "lat": 37.8746, "lng": 32.4933, "active": True},
-        "EV-002": {"model": "Togg T10X", "capacity_kwh": 88.5, "consumption_kwh": 18.5, "battery": 42.5, "suspension": "Sport", "temp": 20.0, "lat": 37.8800, "lng": 32.4800, "active": True},
-        "EV-003": {"model": "Skoda Enyaq iV", "capacity_kwh": 77.0, "consumption_kwh": 15.8, "battery": 15.2, "suspension": "Eco", "temp": 24.0, "lat": 39.9334, "lng": 32.8597, "active": False}
-    }
 
     def save_to_database(telemetries: List[EVTelemetry]):
         db = SessionLocal()
@@ -160,8 +177,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     tire_pressure_psi=t.tire_pressure_psi, 
                     latitude=t.latitude, 
                     longitude=t.longitude,
-                    maintenance_risk_pct=t.maintenance_risk_pct, # EKLENDİ
-                    eco_score=t.eco_score # EKLENDİ
+                    maintenance_risk_pct=t.maintenance_risk_pct,
+                    eco_score=t.eco_score
                 )
                 db.add(db_log)
             db.commit()
