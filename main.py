@@ -9,6 +9,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from database import SessionLocal, TelemetryLog, engine, Base
 from geofence import check_geofence_breach
@@ -19,6 +20,9 @@ warnings.filterwarnings("ignore", message="X does not have valid feature names")
 async def lifespan(app: FastAPI):
     print("App startup başladı")
     try:
+        # Uyarı: SQLite kullanıyorsan eski tabloya yeni kolon ekleyemez, 
+        # localde çalıştırırken ev_telemetry.db dosyasını silip yeniden başlat.
+        # Railway (Postgres) tarafında da veritabanını sıfırlamak gerekebilir.
         Base.metadata.create_all(bind=engine)
         print("Tablolar başarıyla oluşturuldu!")
     except Exception as e:
@@ -66,24 +70,9 @@ class EVTelemetry(BaseModel):
     estimated_range_km: int
     geofence_breach: bool
 
-# YENİ: Şarj İstasyonları için Merkezi Hafıza (State)
 charging_stations_state = {
-    "ST1": {
-        "id": "ST1",
-        "name": "Konya ZES Merkezi",
-        "provider": "ZES",
-        "latitude": 37.87,
-        "longitude": 32.48,
-        "is_available": True
-    },
-    "ST2": {
-        "id": "ST2",
-        "name": "Eşarj Selçuklu",
-        "provider": "Eşarj",
-        "latitude": 37.89,
-        "longitude": 32.50,
-        "is_available": True
-    }
+    "ST1": {"id": "ST1", "name": "Konya ZES Merkezi", "provider": "ZES", "latitude": 37.87, "longitude": 32.48, "is_available": True},
+    "ST2": {"id": "ST2", "name": "Eşarj Selçuklu", "provider": "Eşarj", "latitude": 37.89, "longitude": 32.50, "is_available": True}
 }
 
 @app.get("/")
@@ -108,20 +97,43 @@ def get_telemetry_history(vehicle_id: Optional[str] = None, limit: int = 100, db
 
 @app.get("/api/v1/charging-stations")
 def get_charging_stations():
-    # Hafızadaki güncel listeyi döndürür
     return list(charging_stations_state.values())
 
-# YENİ: Rezervasyon POST Endpoint'i
 @app.post("/api/v1/charging-stations/{station_id}/reserve")
 def reserve_station(station_id: str):
     if station_id in charging_stations_state:
         if charging_stations_state[station_id]["is_available"]:
             charging_stations_state[station_id]["is_available"] = False
-            print(f"REZERVASYON BAŞARILI: {station_id} rezerve edildi!")
             return {"status": "success", "message": f"{station_id} rezerve edildi."}
         else:
             return {"status": "error", "message": "İstasyon zaten dolu!"}
     return {"status": "error", "message": "İstasyon bulunamadı."}
+
+# YENİ: ANDROID İÇİN HAZIRLANMIŞ MERKEZİ ANALİZ ENDPOINTİ
+@app.get("/api/v1/analytics")
+def get_analytics(db: Session = Depends(get_db)):
+    try:
+        total_logs = db.query(func.count(TelemetryLog.id)).scalar() or 0
+        
+        # Basit simülasyon: Veritabanındaki her bir saniyelik log ortalama 0.05 kWh enerji tükettiyse
+        total_energy = round(total_logs * 0.05, 1)
+        
+        # Tüm filonun ortalama eco-score karnesi
+        avg_eco = db.query(func.avg(TelemetryLog.eco_score)).scalar() or 100
+        
+        # Arıza riski %75 ve üzeri olan "Kritik" durumların sayısı
+        critical_count = db.query(func.count(TelemetryLog.id)).filter(TelemetryLog.maintenance_risk_pct >= 75.0).scalar() or 0
+
+        return {
+            "kpi": {
+                "total_energy_kwh": total_energy,
+                "avg_eco_score": int(avg_eco),
+                "critical_risk_count": critical_count
+            }
+        }
+    except Exception as e:
+        print(f"Analytics query error: {e}")
+        return {"kpi": {"total_energy_kwh": 0.0, "avg_eco_score": 0, "critical_risk_count": 0}}
 
 @app.websocket("/ws/telemetry")
 async def websocket_endpoint(websocket: WebSocket):
@@ -138,7 +150,19 @@ async def websocket_endpoint(websocket: WebSocket):
         db = SessionLocal()
         try:
             for t in telemetries:
-                db_log = TelemetryLog(vehicle_id=t.vehicle_id, speed_kmh=t.speed_kmh, battery_level_pct=t.battery_level_pct, regeneration_kw=t.regeneration_kw, cabin_temperature_c=t.cabin_temperature_c, suspension_mode=t.suspension_mode, tire_pressure_psi=t.tire_pressure_psi, latitude=t.latitude, longitude=t.longitude)
+                db_log = TelemetryLog(
+                    vehicle_id=t.vehicle_id, 
+                    speed_kmh=t.speed_kmh, 
+                    battery_level_pct=t.battery_level_pct, 
+                    regeneration_kw=t.regeneration_kw, 
+                    cabin_temperature_c=t.cabin_temperature_c, 
+                    suspension_mode=t.suspension_mode, 
+                    tire_pressure_psi=t.tire_pressure_psi, 
+                    latitude=t.latitude, 
+                    longitude=t.longitude,
+                    maintenance_risk_pct=t.maintenance_risk_pct, # EKLENDİ
+                    eco_score=t.eco_score # EKLENDİ
+                )
                 db.add(db_log)
             db.commit()
         except Exception as e:
@@ -165,7 +189,6 @@ async def websocket_endpoint(websocket: WebSocket):
                                 features = [[speed, state["battery"], regen, state["temp"], 33.0]]
                                 risk_percentage = round(ai_model.predict_proba(features)[0][1] * 100, 1)
                         except Exception as e:
-                            print(f"AI prediction error: {e}")
                             risk_percentage = 0.0
 
                     telemetry = EVTelemetry(vehicle_id=v_id, vehicle_model=state["model"], speed_kmh=speed, battery_level_pct=round(state["battery"], 2), regeneration_kw=regen, cabin_temperature_c=state["temp"], suspension_mode=state["suspension"], tire_pressure_psi=33.0, latitude=state["lat"], longitude=state["lng"], maintenance_risk_pct=risk_percentage, eco_score=85, estimated_range_km=350, geofence_breach=check_geofence_breach(state["lat"], state["lng"]))
@@ -175,10 +198,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await asyncio.to_thread(save_to_database, fleet_telemetry_list)
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
-            print("WebSocket telemetry sender task cancelled")
-            raise
-        except Exception as e:
-            print(f"WebSocket send error: {e}")
+            pass
 
     sender_task = asyncio.create_task(send_telemetry())
 
@@ -186,23 +206,15 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             try:
                 data = await websocket.receive_json()
-                print(f"\n🚀🚀🚀 KOMUT GELDİ: {data} 🚀🚀🚀\n")
                 if data.get("action") == "set_suspension":
                     target_vehicle = data.get("vehicle_id")
                     new_mode = data.get("value")
                     if target_vehicle in fleet_state:
                         fleet_state[target_vehicle]["suspension"] = new_mode
-                        print(f"SUCCESS: {target_vehicle} için süspansiyon {new_mode} yapıldı!")
             except WebSocketDisconnect:
-                print("WebSocket client disconnected")
                 break
-            except Exception as e:
-                print(f"WebSocket receive error: {e}")
+            except Exception:
                 break
     finally:
         sender_task.cancel()
-        try:
-            await sender_task
-        except asyncio.CancelledError:
-            pass
         print("WebSocket connection closed")
