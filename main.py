@@ -207,32 +207,45 @@ async def websocket_endpoint(websocket: WebSocket):
                     telemetry = EVTelemetry(vehicle_id=v_id, vehicle_model=state["model"], speed_kmh=speed, battery_level_pct=round(state["battery"], 2), regeneration_kw=regen, cabin_temperature_c=state["temp"], suspension_mode=state["suspension"], tire_pressure_psi=33.0, latitude=state["lat"], longitude=state["lng"], maintenance_risk_pct=risk_percentage, eco_score=85, estimated_range_km=350, geofence_breach=check_geofence_breach(state["lat"], state["lng"]))
                     fleet_telemetry_list.append(telemetry)
 
+                # DİKKAT: Gönderme işlemini yaptık
                 await websocket.send_json([t.model_dump() for t in fleet_telemetry_list])
                 await asyncio.to_thread(save_to_database, fleet_telemetry_list)
-                await asyncio.sleep(1)
+                await asyncio.sleep(1) # Saniyede bir dönecek
         except asyncio.CancelledError:
             pass
+        except Exception as e:
+            print(f"Send task error: {e}")
 
+    # YENİ MİMARİ: Dinleme ve gönderme görevlerini aynı anda başlatıp yönetecek ana yapı
+    async def receive_messages():
+        try:
+            while True:
+                # Dinleme işlemine ufak bir zaman aşımı ekledik ki diğer taskleri kilitlemesin
+                try:
+                    data = await asyncio.wait_for(websocket.receive_json(), timeout=1.0)
+                    if data.get("action") == "set_suspension":
+                        target_vehicle = data.get("vehicle_id")
+                        new_mode = data.get("value")
+                        if target_vehicle in fleet_state:
+                            fleet_state[target_vehicle]["suspension"] = new_mode
+                    elif data.get("action") == "reset_battery":
+                        for v_id, state in fleet_state.items():
+                            state["battery"] = 100.0
+                        print("🔋 Patron komutu geldi: Tüm filonun bataryaları %100'e sıfırlandı!")
+                except asyncio.TimeoutError:
+                    # Zaman aşımı olursa (mesaj gelmezse) sorun yok, döngü devam etsin.
+                    continue
+        except WebSocketDisconnect:
+            print("WebSocket connection closed normally by client.")
+        except Exception as e:
+             print(f"Receive task error/disconnect: {e}")
+
+    # Gönderme (send) taskını başlatıyoruz
     sender_task = asyncio.create_task(send_telemetry())
-
+    
+    # Dinleme (receive) döngüsünü de ana iş parçacığında çalıştırıyoruz. Timeout ile kilitlenmeyi önledik.
     try:
-        while True:
-            try:
-                data = await websocket.receive_json()
-                if data.get("action") == "set_suspension":
-                    target_vehicle = data.get("vehicle_id")
-                    new_mode = data.get("value")
-                    if target_vehicle in fleet_state:
-                        fleet_state[target_vehicle]["suspension"] = new_mode
-                # YENİ: Patron Modu - Şarjları Sıfırla
-                elif data.get("action") == "reset_battery":
-                    for v_id, state in fleet_state.items():
-                        state["battery"] = 100.0
-                    print("🔋 Patron komutu geldi: Tüm filonun bataryaları %100'e sıfırlandı!")
-            except WebSocketDisconnect:
-                break
-            except Exception:
-                break
+        await receive_messages()
     finally:
         sender_task.cancel()
-        print("WebSocket connection closed")
+        print("WebSocket cleaned up")
