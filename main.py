@@ -67,7 +67,6 @@ class EVTelemetry(BaseModel):
     estimated_range_km: int
     geofence_breach: bool
 
-# YENİ: Chat isteklerini yakalamak için Pydantic modeli
 class ChatRequest(BaseModel):
     message: str
 
@@ -76,7 +75,6 @@ charging_stations_state = {
     "ST2": {"id": "ST2", "name": "Eşarj Selçuklu", "provider": "Eşarj", "latitude": 37.89, "longitude": 32.50, "is_available": True}
 }
 
-# MİMARİ DÜZELTME: fleet_state artık Global (Tüm endpointler erişebilir)
 fleet_state = {
     "EV-001": {"model": "Mercedes EQE", "capacity_kwh": 90.6, "consumption_kwh": 16.5, "battery": 85.0, "suspension": "Comfort", "temp": 22.0, "lat": 37.8746, "lng": 32.4933, "active": True},
     "EV-002": {"model": "Togg T10X", "capacity_kwh": 88.5, "consumption_kwh": 18.5, "battery": 42.5, "suspension": "Sport", "temp": 20.0, "lat": 37.8800, "lng": 32.4800, "active": True},
@@ -136,12 +134,10 @@ def get_analytics(db: Session = Depends(get_db)):
         print(f"Analytics query error: {e}")
         return {"kpi": {"total_energy_kwh": 0.0, "avg_eco_score": 0, "critical_risk_count": 0}}
 
-# YENİ: Akıllı Filo Asistanı Endpoint'i
 @app.post("/api/v1/chat")
 def fleet_assistant_chat(request: ChatRequest):
     msg = request.message.lower()
     
-    # NLP Simülasyonu: Gelen mesaja göre anlık state'i tarayıp cevap üretir
     if "şarj" in msg or "batarya" in msg:
         low_batt_vehicles = [v for v, data in fleet_state.items() if data["battery"] < 20.0]
         if low_batt_vehicles:
@@ -228,6 +224,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     new_mode = data.get("value")
                     if target_vehicle in fleet_state:
                         fleet_state[target_vehicle]["suspension"] = new_mode
+                # YENİ: Patron Modu - Şarjları Sıfırla
+                elif data.get("action") == "reset_battery":
+                    for v_id, state in fleet_state.items():
+                        state["battery"] = 100.0
+                    print("🔋 Patron komutu geldi: Tüm filonun bataryaları %100'e sıfırlandı!")
             except WebSocketDisconnect:
                 break
             except Exception:
