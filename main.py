@@ -124,8 +124,13 @@ class EVTelemetry(BaseModel):
 class ChatRequest(BaseModel):
     message: str
 
-# YENİ: Login isteği için model
+# Login isteği için model
 class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+# YENİ: Kayıt Olma İsteği Modeli
+class RegisterRequest(BaseModel):
     email: str
     password: str
 
@@ -148,7 +153,7 @@ def read_root():
 def health_check():
     return {"status": "ok", "service": "ev-telemetry-backend"}
 
-# --- YENİ: LOGIN ENDPOINT'İ ---
+# --- LOGIN ENDPOINT'İ ---
 @app.post("/api/v1/login")
 def login(request: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == request.email).first()
@@ -179,6 +184,31 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
         "role": user.role,
         "assigned_vehicle": user.assigned_vehicle_id
     }
+
+# --- YENİ: KAYIT OL (REGISTER) ENDPOINT'İ ---
+@app.post("/api/v1/register")
+def register(request: RegisterRequest, db: Session = Depends(get_db)):
+    # 1. E-posta adresi veritabanında var mı kontrol et
+    existing_user = db.query(User).filter(User.email == request.email).first()
+    if existing_user:
+        raise HTTPException(
+            status_code=400,
+            detail="Bu e-posta adresi zaten kullanımda."
+        )
+    
+    # 2. Yeni kullanıcıyı oluştur (Şifreyi kriptolayarak kaydet)
+    # Start-up mantığı: Yeni kayıt olan herkes default olarak 'driver' (şoför) olur.
+    new_user = User(
+        email=request.email,
+        hashed_password=get_password_hash(request.password),
+        role="driver", 
+        assigned_vehicle_id=None # Henüz bir araç atanmamış
+    )
+    
+    db.add(new_user)
+    db.commit()
+    
+    return {"status": "success", "message": "Kayıt başarılı! Lütfen giriş yapın."}
 
 @app.get("/api/v1/telemetry/history")
 def get_telemetry_history(vehicle_id: Optional[str] = None, limit: int = 100, db: Session = Depends(get_db)):
