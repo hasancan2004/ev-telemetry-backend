@@ -24,7 +24,7 @@ else:
 
 SessionLocal = sessionmaker(
     autocommit=False,
-    autlush=False,
+    autoflush=False, # 🔥 HATA BURADAYDI, DÜZELTİLDİ 🔥
     bind=engine
 )
 
