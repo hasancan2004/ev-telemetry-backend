@@ -1,20 +1,67 @@
 import asyncio
 import random
 import warnings
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
 import joblib
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
-from database import SessionLocal, TelemetryLog, engine, Base
+# YENİ AUTH KÜTÜPHANELERİ
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+
+from database import SessionLocal, TelemetryLog, User, engine, Base
 from geofence import check_geofence_breach
 
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
+
+# --- AUTHENTICATION (JWT) AYARLARI ---
+SECRET_KEY = "super_gizli_filo_anahtari_hck" # Gerçek projede bunu .env dosyasına saklarız
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # Token 1 hafta geçerli olsun
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# --- VERİTABANI İLK YÜKLEME (Test Kullanıcıları Ekleme) ---
+def create_test_users(db: Session):
+    # Eğer veritabanında hiç kullanıcı yoksa, test için 1 Patron ve 1 Şoför ekle
+    if not db.query(User).first():
+        admin = User(
+            email="patron@ridebase.com",
+            hashed_password=get_password_hash("123456"),
+            role="admin"
+        )
+        driver = User(
+            email="sofor@ridebase.com",
+            hashed_password=get_password_hash("123456"),
+            role="driver",
+            assigned_vehicle_id="EV-001"
+        )
+        db.add_all([admin, driver])
+        db.commit()
+        print("✅ Test kullanıcıları (Patron ve Şoför) oluşturuldu!")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -22,6 +69,12 @@ async def lifespan(app: FastAPI):
     try:
         Base.metadata.create_all(bind=engine)
         print("Tablolar başarıyla oluşturuldu!")
+        
+        # Test kullanıcılarını oluştur (Sadece ilk çalışmada)
+        db = SessionLocal()
+        create_test_users(db)
+        db.close()
+        
     except Exception as e:
         print(f"Database startup error: {e}")
     yield
@@ -51,6 +104,7 @@ def get_db():
     finally:
         db.close()
 
+# --- PYDANTIC MODELLERİ ---
 class EVTelemetry(BaseModel):
     vehicle_id: str
     vehicle_model: str
@@ -70,6 +124,11 @@ class EVTelemetry(BaseModel):
 class ChatRequest(BaseModel):
     message: str
 
+# YENİ: Login isteği için model
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
 charging_stations_state = {
     "ST1": {"id": "ST1", "name": "Konya ZES Merkezi", "provider": "ZES", "latitude": 37.87, "longitude": 32.48, "is_available": True},
     "ST2": {"id": "ST2", "name": "Eşarj Selçuklu", "provider": "Eşarj", "latitude": 37.89, "longitude": 32.50, "is_available": True}
@@ -83,11 +142,43 @@ fleet_state = {
 
 @app.get("/")
 def read_root():
-    return {"status": "online", "message": "Fleet Backend with AI Engine is running on Railway!"}
+    return {"status": "online", "message": "Fleet Backend with AI Engine and Auth is running on Railway!"}
 
 @app.get("/health")
 def health_check():
     return {"status": "ok", "service": "ev-telemetry-backend"}
+
+# --- YENİ: LOGIN ENDPOINT'İ ---
+@app.post("/api/v1/login")
+def login(request: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == request.email).first()
+    
+    # Kullanıcı yoksa veya şifre yanlışsa 401 hatası dön
+    if not user or not verify_password(request.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Hatalı e-posta veya şifre",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Şifre doğruysa Token üret
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    # Token'ın içine kullanıcının rolünü ve (eğer şoförse) atanmış aracını gömüyoruz
+    token_data = {
+        "sub": user.email, 
+        "role": user.role, 
+        "assigned_vehicle": user.assigned_vehicle_id
+    }
+    
+    access_token = create_access_token(data=token_data, expires_delta=access_token_expires)
+    
+    return {
+        "access_token": access_token, 
+        "token_type": "bearer",
+        "role": user.role,
+        "assigned_vehicle": user.assigned_vehicle_id
+    }
 
 @app.get("/api/v1/telemetry/history")
 def get_telemetry_history(vehicle_id: Optional[str] = None, limit: int = 100, db: Session = Depends(get_db)):
