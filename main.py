@@ -116,22 +116,31 @@ def reserve_station(station_id: str):
     return {"status": "error", "message": "İstasyon bulunamadı."}
 
 @app.get("/api/v1/analytics")
-def get_analytics(db: Session = Depends(get_db)):
+def get_analytics():
     try:
-        total_logs = db.query(func.count(TelemetryLog.id)).scalar() or 0
-        total_energy = round(total_logs * 0.05, 1)
-        avg_eco = db.query(func.avg(TelemetryLog.eco_score)).scalar() or 100
-        critical_count = db.query(func.count(TelemetryLog.id)).filter(TelemetryLog.maintenance_risk_pct >= 75.0).scalar() or 0
+        total_energy = 0.0
+        critical_count = 0
+        
+        for state in fleet_state.values():
+            used_pct = 100.0 - state["battery"]
+            energy_used = state["capacity_kwh"] * (used_pct / 100.0)
+            total_energy += energy_used
+            
+            if state["battery"] < 20.0:
+                critical_count += 1
+                
+        import random
+        avg_eco = random.randint(75, 95)
 
         return {
             "kpi": {
-                "total_energy_kwh": total_energy,
-                "avg_eco_score": int(avg_eco),
+                "total_energy_kwh": round(total_energy, 1),
+                "avg_eco_score": avg_eco,
                 "critical_risk_count": critical_count
             }
         }
     except Exception as e:
-        print(f"Analytics query error: {e}")
+        print(f"Analytics calculation error: {e}")
         return {"kpi": {"total_energy_kwh": 0.0, "avg_eco_score": 0, "critical_risk_count": 0}}
 
 @app.post("/api/v1/chat")
@@ -207,20 +216,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     telemetry = EVTelemetry(vehicle_id=v_id, vehicle_model=state["model"], speed_kmh=speed, battery_level_pct=round(state["battery"], 2), regeneration_kw=regen, cabin_temperature_c=state["temp"], suspension_mode=state["suspension"], tire_pressure_psi=33.0, latitude=state["lat"], longitude=state["lng"], maintenance_risk_pct=risk_percentage, eco_score=85, estimated_range_km=350, geofence_breach=check_geofence_breach(state["lat"], state["lng"]))
                     fleet_telemetry_list.append(telemetry)
 
-                # DİKKAT: Gönderme işlemini yaptık
                 await websocket.send_json([t.model_dump() for t in fleet_telemetry_list])
                 await asyncio.to_thread(save_to_database, fleet_telemetry_list)
-                await asyncio.sleep(1) # Saniyede bir dönecek
+                await asyncio.sleep(1)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             print(f"Send task error: {e}")
 
-    # YENİ MİMARİ: Dinleme ve gönderme görevlerini aynı anda başlatıp yönetecek ana yapı
     async def receive_messages():
         try:
             while True:
-                # Dinleme işlemine ufak bir zaman aşımı ekledik ki diğer taskleri kilitlemesin
                 try:
                     data = await asyncio.wait_for(websocket.receive_json(), timeout=1.0)
                     if data.get("action") == "set_suspension":
@@ -233,17 +239,14 @@ async def websocket_endpoint(websocket: WebSocket):
                             state["battery"] = 100.0
                         print("🔋 Patron komutu geldi: Tüm filonun bataryaları %100'e sıfırlandı!")
                 except asyncio.TimeoutError:
-                    # Zaman aşımı olursa (mesaj gelmezse) sorun yok, döngü devam etsin.
                     continue
         except WebSocketDisconnect:
             print("WebSocket connection closed normally by client.")
         except Exception as e:
              print(f"Receive task error/disconnect: {e}")
 
-    # Gönderme (send) taskını başlatıyoruz
     sender_task = asyncio.create_task(send_telemetry())
     
-    # Dinleme (receive) döngüsünü de ana iş parçacığında çalıştırıyoruz. Timeout ile kilitlenmeyi önledik.
     try:
         await receive_messages()
     finally:
