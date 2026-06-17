@@ -67,6 +67,9 @@ def create_test_users(db: Session):
 async def lifespan(app: FastAPI):
     print("App startup başladı")
     try:
+        # 🔥 YENİ EKLENEN SATIR: Sistemi başlatmadan önce eski ve hatalı tabloları uçur!
+        Base.metadata.drop_all(bind=engine)
+        
         Base.metadata.create_all(bind=engine)
         print("Tablolar başarıyla oluşturuldu!")
         
